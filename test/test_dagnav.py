@@ -2,9 +2,9 @@ from pathlib import Path
 import urllib.request
 import pytest
 import numpy as np
-from numpy.testing import assert_equal
+from numpy.testing import assert_allclose, assert_equal
 from test import config
-from pymoab import core
+from pymoab import core, types
 
 import pydagmc
 
@@ -873,6 +873,184 @@ def test_bounds(fuel_pin_model):
     for surf_id, expected_bounds in exp_surface_bounds.items():
         surface_bounds = model.surfaces_by_id[surf_id].bounds
         assert_equal(surface_bounds, expected_bounds)
+
+
+def _geometry_vertices(model):
+    return np.unique(np.concatenate([
+        surface.triangle_conn.ravel() for surface in model.surfaces
+    ]))
+
+
+def _topology(model):
+    ids = (sorted(model.surfaces_by_id), sorted(model.volumes_by_id))
+    groups = {
+        name: (sorted(group.surface_ids), sorted(group.volume_ids))
+        for name, group in model.groups_by_name.items()
+    }
+    senses = {
+        surface.id: [v.id if v is not None else None
+                     for v in surface.senses]
+        for surface in model.surfaces
+    }
+    return ids, groups, senses
+
+
+def _length_metadata(model, tag_name):
+    tag = model.mb.tag_get_handle(tag_name)
+    tagged_sets = model.mb.get_entities_by_type_and_tag(
+        model.mb.get_root_set(), types.MBENTITYSET, [tag],
+        np.array([[None]]),
+    )
+    return model.mb.tag_get_data(tag, tagged_sets)
+
+
+@pytest.mark.parametrize('scale', [100.0, 0.01])
+def test_model_length_multiplier_and_written_file_round_trip(
+        request, tmp_path, scale):
+    source = request.path.parent / 'fuel_pin.h5m'
+    source_bytes = source.read_bytes()
+    baseline = pydagmc.Model(str(source))
+    model = pydagmc.Model(str(source), length_multiplier=scale)
+
+    volume = model.volumes_by_id[1]
+    surface = model.surfaces_by_id[1]
+    original_bounds = baseline.volumes_by_id[1].bounds
+    original_area = baseline.surfaces_by_id[1].area
+    original_volume = baseline.volumes_by_id[1].volume
+    original_topology = _topology(baseline)
+    baseline_vertices = _geometry_vertices(baseline)
+    scaled_vertices = _geometry_vertices(model)
+    original_coords = baseline.mb.get_coords(baseline_vertices)
+    scaled_coords = model.mb.get_coords(scaled_vertices)
+    baseline_connectivity = {
+        surface.id: surface.triangle_conn for surface in baseline.surfaces
+    }
+
+    scaled_bounds = volume.bounds
+    assert np.any(original_coords < 0.0)
+    assert any(len(np.unique(conn)) < conn.size
+               for conn in baseline_connectivity.values())
+    assert_allclose(scaled_coords, original_coords * scale)
+    assert_allclose(scaled_bounds[0], original_bounds[0] * scale)
+    assert_allclose(scaled_bounds[1], original_bounds[1] * scale)
+    assert surface.area == pytest.approx(original_area * scale**2)
+    assert volume.volume == pytest.approx(original_volume * scale**3)
+    assert model.length_multiplier == scale
+    assert _topology(model) == original_topology
+    for scaled_surface in model.surfaces:
+        assert_equal(scaled_surface.triangle_conn,
+                     baseline_connectivity[scaled_surface.id])
+    assert source.read_bytes() == source_bytes
+
+    for tag_name in ('FACETING_TOL', 'GEOMETRY_RESABS'):
+        original_tolerance = _length_metadata(baseline, tag_name)
+        assert len(original_tolerance) > 0
+        assert_allclose(_length_metadata(model, tag_name),
+                        original_tolerance * scale)
+
+    output = tmp_path / 'scaled_fuel_pin.h5m'
+    model.write_file(output)
+    reloaded = pydagmc.Model(str(output))
+    assert_allclose(reloaded.volumes_by_id[1].bounds[0], scaled_bounds[0])
+    assert_allclose(reloaded.volumes_by_id[1].bounds[1], scaled_bounds[1])
+    assert reloaded.surfaces_by_id[1].area == pytest.approx(surface.area)
+    assert reloaded.volumes_by_id[1].volume == pytest.approx(volume.volume)
+
+
+def test_model_length_multiplier_removes_serialized_obb_tree(fuel_pin_model):
+    model = fuel_pin_model
+    geometry_set = model.volumes_by_id[1].handle
+    unrelated_coords = np.array([17.0, -23.0, 41.0])
+    unrelated_vertex = model.mb.create_vertices(
+        unrelated_coords.reshape(1, 3)
+    )[0]
+    unrelated_set = model.mb.create_meshset()
+    model.mb.add_entities(unrelated_set, [unrelated_vertex])
+    unrelated_tag = model.mb.tag_get_handle(
+        'FACETING_TOL', 1, types.MB_TYPE_DOUBLE, types.MB_TAG_SPARSE,
+        create_if_missing=True,
+    )
+    unrelated_tag_value = 17.0
+    model.mb.tag_set_data(unrelated_tag, unrelated_set,
+                          unrelated_tag_value)
+    obb_root = model.mb.create_meshset()
+    obb_child = model.mb.create_meshset()
+    model.mb.add_child_meshset(obb_root, obb_child)
+    unrelated_obb_root = model.mb.create_meshset()
+    obb_root_tag = model.mb.tag_get_handle(
+        'OBB_ROOT', 1, types.MB_TYPE_HANDLE, types.MB_TAG_SPARSE,
+        create_if_missing=True,
+    )
+    model.mb.tag_set_data(obb_root_tag, geometry_set, obb_root)
+    model.mb.tag_set_data(obb_root_tag, unrelated_set, unrelated_obb_root)
+    geometry_vertices = _geometry_vertices(model)
+    original_coords = model.mb.get_coords(geometry_vertices)
+
+    model = pydagmc.Model(model.mb, length_multiplier=2.0)
+
+    assert_allclose(model.mb.get_coords(geometry_vertices),
+                    original_coords * 2.0)
+    assert_equal(model.mb.get_coords([unrelated_vertex]), unrelated_coords)
+    assert model.mb.tag_get_data(
+        unrelated_tag, unrelated_set, flat=True,
+    )[0] == unrelated_tag_value
+    with pytest.raises(RuntimeError):
+        model.mb.tag_get_data(obb_root_tag, geometry_set)
+    remaining_sets = model.mb.get_entities_by_type(
+        model.mb.get_root_set(), types.MBENTITYSET,
+    )
+    assert obb_root not in remaining_sets
+    assert obb_child not in remaining_sets
+    assert unrelated_obb_root in remaining_sets
+    assert model.mb.tag_get_data(
+        obb_root_tag, unrelated_set, flat=True,
+    )[0] == unrelated_obb_root
+
+    model = pydagmc.Model(model.mb, length_multiplier=2.0)
+    assert_allclose(model.mb.get_coords(geometry_vertices),
+                    original_coords * 4.0)
+    assert_equal(model.mb.get_coords([unrelated_vertex]), unrelated_coords)
+
+
+def test_model_length_multiplier_identity_is_no_op(fuel_pin_model):
+    original_coords = fuel_pin_model.mb.get_coords(
+        fuel_pin_model.mb.get_entities_by_type(
+            fuel_pin_model.mb.get_root_set(), types.MBVERTEX,
+        )
+    )
+    model = pydagmc.Model(fuel_pin_model.mb)
+    current_coords = fuel_pin_model.mb.get_coords(
+        fuel_pin_model.mb.get_entities_by_type(
+            model.mb.get_root_set(), types.MBVERTEX,
+        )
+    )
+    assert_equal(current_coords, original_coords)
+
+
+def test_model_length_multiplier_empty_geometry_is_no_op():
+    model = pydagmc.Model()
+    root = model.mb.get_root_set()
+    tag = model.mb.tag_get_handle(
+        'FACETING_TOL', 1, types.MB_TYPE_DOUBLE, types.MB_TAG_SPARSE,
+        create_if_missing=True,
+    )
+    model.mb.tag_set_data(tag, root, 0.125)
+
+    scaled = pydagmc.Model(model.mb, length_multiplier=2.0)
+
+    assert scaled.mb.tag_get_data(tag, root, flat=True)[0] == 0.125
+
+
+@pytest.mark.parametrize('factor', [0.0, -1.0, np.nan, np.inf, -np.inf])
+def test_model_length_multiplier_rejects_nonpositive_or_nonfinite(factor):
+    with pytest.raises(ValueError, match='finite and positive'):
+        pydagmc.Model(length_multiplier=factor)
+
+
+@pytest.mark.parametrize('factor', [None, '100', True, complex(1.0, 0.0)])
+def test_model_length_multiplier_rejects_nonreal(factor):
+    with pytest.raises(TypeError, match='real number'):
+        pydagmc.Model(length_multiplier=factor)
 
 def test_add_groups(fuel_pin_model):
     model = fuel_pin_model

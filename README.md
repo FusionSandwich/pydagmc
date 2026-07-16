@@ -14,6 +14,7 @@ PyDAGMC classes provide the ability to perform basic queries as properties of th
 - triangle connectivity and coordinates underneath any class instance
 - movement of volumes or surfaces into and out of groups
 - VTK file generation for all triangles contained under any class instance
+- optional geometry scaling with `Model(..., length_multiplier=factor)`
 
 
 # Example
@@ -38,6 +39,19 @@ new_group = pydagmc.Group.create(model, name="my_new_group", group_id=10)
 print(new_group)
 
 ```
+
+To convert a model authored in metres to centimetres while loading it:
+
+```python
+model = pydagmc.Model('dagmc.h5m', length_multiplier=100.0)
+model.write_file('dagmc_cm.h5m')
+```
+
+The multiplier must be finite and positive. Passing an existing
+`pymoab.core.Core` scales that database in place; constructing another model
+from the same database applies another scale. Serialized OBB trees are removed
+because they no longer match the coordinates.
+
 Output:
 
 ```shell
