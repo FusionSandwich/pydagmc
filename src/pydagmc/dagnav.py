@@ -8,6 +8,7 @@ from __future__ import annotations
 from abc import abstractmethod
 from functools import cached_property
 from itertools import chain
+from numbers import Real
 import os
 from pathlib import Path
 from typing import Optional, Dict, Union
@@ -37,7 +38,17 @@ class Model:
 
     mb: core.Core
 
-    def __init__(self, moab_file=None):
+    def __init__(self, moab_file=None, length_multiplier=1.0):
+        """Load a MOAB model, optionally scaling its coordinates.
+
+        ``length_multiplier`` is applied during construction. If
+        ``moab_file`` is an existing :class:`pymoab.core.Core`, that database
+        is modified in place, so constructing another model from the same
+        database applies another scale.
+        """
+        length_multiplier = self._validate_length_multiplier(
+            length_multiplier
+        )
         if isinstance(moab_file, core.Core):
             self.mb = moab_file
         else:
@@ -45,10 +56,30 @@ class Model:
             if moab_file is not None:
                 self.mb.load_file(moab_file)
 
+        self._length_multiplier = length_multiplier
+        self._apply_length_multiplier()
+
         self.used_ids = {}
         self.used_ids[Surface] = set(self.surfaces_by_id.keys())
         self.used_ids[Volume] = set(self.volumes_by_id.keys())
         self.used_ids[Group] = set(group.id for group in self.groups)
+
+    @staticmethod
+    def _validate_length_multiplier(value: Real) -> float:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise TypeError("Length multiplier must be a real number.")
+
+        value = float(value)
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                "Length multiplier must be finite and positive."
+            )
+        return value
+
+    @property
+    def length_multiplier(self) -> float:
+        """Multiplier applied to coordinates when the model was loaded."""
+        return self._length_multiplier
 
     def _sets_by_category(self, set_type : str):
         """Return all sets of a given type"""
@@ -245,6 +276,107 @@ class Model:
             The file to write to.
         """
         self.mb.write_file(str(filename))
+
+    def _apply_length_multiplier(self) -> None:
+        """Apply the configured multiplier to this MOAB database."""
+
+        factor = self.length_multiplier
+        if factor == 1.0:
+            return
+
+        triangles = rng.Range()
+        for surface in self.surfaces:
+            triangles.merge(surface.triangle_handles)
+        if len(triangles) == 0:
+            return
+        vertices = np.unique(self.mb.get_connectivity(triangles))
+        if len(vertices) == 0:
+            return
+
+        coords = self.mb.get_coords(vertices)
+        self._delete_stale_obb_trees()
+        self.mb.set_coords(vertices, coords * factor)
+        self._scale_length_metadata(factor)
+
+    def _delete_stale_obb_trees(self) -> None:
+        """Remove serialized MOAB OBB nodes and their geometry root tags."""
+        try:
+            obb_root_tag = self.mb.tag_get_handle(
+                "OBB_ROOT", 1, types.MB_TYPE_HANDLE, types.MB_TAG_SPARSE
+            )
+        except RuntimeError as error:
+            if error.args[0].error_value == types.MB_TAG_NOT_FOUND:
+                return
+            raise
+
+        root = self.mb.get_root_set()
+        tagged_sets = self.mb.get_entities_by_type_and_tag(
+            root, types.MBENTITYSET, [obb_root_tag], np.array([[None]]),
+        )
+        geometry_sets = np.fromiter(
+            (entity.handle for entity in chain(self.surfaces, self.volumes)),
+            dtype=np.uint64,
+        )
+        geometry_sets = np.intersect1d(tagged_sets, geometry_sets)
+        if len(geometry_sets) == 0:
+            return
+
+        roots = self.mb.tag_get_data(
+            obb_root_tag, geometry_sets, flat=True,
+        )
+        tree_nodes = set()
+        for root in roots:
+            tree_nodes.add(int(root))
+            tree_nodes.update(
+                int(node) for node in self.mb.get_child_meshsets(root, 0)
+            )
+        self.mb.tag_delete_data(obb_root_tag, geometry_sets)
+
+        self.mb.delete_entities(
+            np.asarray(sorted(tree_nodes), dtype=np.uint64)
+        )
+
+    def _scale_length_metadata(self, factor: float) -> None:
+        """Scale stored metadata values expressed in geometry units."""
+        root = self.mb.get_root_set()
+        geometry_sets = {
+            int(entity.handle) for entity in chain(
+                self.surfaces, self.volumes
+            )
+        }
+        for tag_name in ("FACETING_TOL", "GEOMETRY_RESABS"):
+            try:
+                tag = self.mb.tag_get_handle(
+                    tag_name, 1, types.MB_TYPE_DOUBLE, types.MB_TAG_SPARSE
+                )
+            except RuntimeError as error:
+                if error.args[0].error_value == types.MB_TAG_NOT_FOUND:
+                    continue
+                raise
+
+            tagged_sets = self.mb.get_entities_by_type_and_tag(
+                root, types.MBENTITYSET, [tag], np.array([[None]]),
+            )
+            scoped_sets = []
+            for entity_set in tagged_sets:
+                contained_sets = self.mb.get_entities_by_type(
+                    entity_set, types.MBENTITYSET, recur=True,
+                )
+                if (int(entity_set) in geometry_sets or
+                        geometry_sets.intersection(map(int, contained_sets))):
+                    scoped_sets.append(entity_set)
+            if scoped_sets:
+                scoped_sets = np.asarray(scoped_sets, dtype=np.uint64)
+                values = self.mb.tag_get_data(tag, scoped_sets)
+                self.mb.tag_set_data(tag, scoped_sets, values * factor)
+
+            try:
+                root_value = self.mb.tag_get_data(tag, root)
+            except RuntimeError as error:
+                if error.args[0].error_value == types.MB_TAG_NOT_FOUND:
+                    continue
+                raise
+            self.mb.tag_set_data(tag, root, root_value * factor)
 
     def add_groups(self, group_map):
         """Adds groups of GeometrySets to the model.
